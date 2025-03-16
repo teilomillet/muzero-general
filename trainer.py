@@ -4,6 +4,7 @@ import time
 import numpy
 import ray
 import torch
+import wandb
 
 import models
 
@@ -262,6 +263,17 @@ class Trainer:
         loss.backward()
         self.optimizer.step()
         self.training_step += 1
+
+        # Log metrics to wandb
+        if wandb.run is not None and self.training_step % 10 == 0:  # Log every 10 steps to avoid flooding
+            wandb.log({
+                "trainer/total_loss": loss.item(),
+                "trainer/value_loss": value_loss.mean().item(),
+                "trainer/reward_loss": reward_loss.mean().item(),
+                "trainer/policy_loss": policy_loss.mean().item(),
+                "trainer/learning_rate": self.optimizer.param_groups[0]["lr"],
+                "trainer/training_step": self.training_step,
+            }, step=self.training_step)
 
         return (
             priorities,

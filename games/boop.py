@@ -2,6 +2,7 @@ import datetime
 import pathlib
 import numpy as np
 import torch
+import wandb
 
 from .abstract_game import AbstractGame
 
@@ -25,7 +26,7 @@ class MuZeroConfig:
 
         # Evaluate
         self.muzero_player = 0  # Turn Muzero begins to play (0: MuZero plays first, 1: MuZero plays second)
-        self.opponent = None  # Hard coded agent that MuZero faces to assess his progress in multiplayer games. It doesn't influence training. None, "random" or "expert" if implemented in the Game class
+        self.opponent = "random"  # Hard coded agent that MuZero faces to assess his progress in multiplayer games. It doesn't influence training. None, "random" or "expert" if implemented in the Game class
 
         ### Self-Play
         self.num_workers = 1  # Number of simultaneous threads/workers self-playing to feed the replay buffer
@@ -138,7 +139,41 @@ class Game(AbstractGame):
             The new observation, the reward and a boolean if the game has ended.
         """
         observation, reward, done = self.env.step(action)
+        
+        # Log game state to wandb if it's initialized
+        if wandb.run is not None and done:
+            self.log_game_state_to_wandb()
+            
         return observation, reward, done
+        
+    def log_game_state_to_wandb(self):
+        """
+        Log the current game board state to wandb for visualization.
+        """
+        if not hasattr(self, 'game_count'):
+            self.game_count = 0
+        else:
+            self.game_count += 1
+            
+        # Create a visual representation of the board
+        board_size = self.env.board_size
+        board_image = np.zeros((board_size, board_size, 3), dtype=np.uint8)
+        
+        # Color coding: Player 1 (Red), Player 2 (Blue), Empty (White)
+        for r in range(board_size):
+            for c in range(board_size):
+                if self.env.board[0, r, c] == 1:  # Player 1 pieces
+                    board_image[r, c] = [255, 0, 0]  # Red
+                elif self.env.board[1, r, c] == 1:  # Player 2 pieces
+                    board_image[r, c] = [0, 0, 255]  # Blue
+                else:
+                    board_image[r, c] = [255, 255, 255]  # White for empty
+        
+        # Log the board state
+        wandb.log({
+            f"game_board_{self.game_count}": wandb.Image(board_image, 
+                                                         caption=f"Game {self.game_count} - Final Board State")
+        })
 
     def to_play(self):
         """
