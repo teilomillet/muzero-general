@@ -39,16 +39,20 @@ class ReplayBuffer:
                 # Initial priorities for the prioritized replay (See paper appendix Training)
                 priorities = []
                 for i, root_value in enumerate(game_history.root_values):
+                    target_value = self.compute_target_value(game_history, i)
                     priority = (
-                        numpy.abs(
-                            root_value - self.compute_target_value(game_history, i)
-                        )
-                        ** self.config.PER_alpha
+                        numpy.abs(root_value - target_value) ** self.config.PER_alpha
                     )
+                    # Check for NaN and replace with a small positive value
+                    if numpy.isnan(priority):
+                        priority = 1.0
                     priorities.append(priority)
 
                 game_history.priorities = numpy.array(priorities, dtype="float32")
+                # Ensure game_priority is not NaN
                 game_history.game_priority = numpy.max(game_history.priorities)
+                if numpy.isnan(game_history.game_priority):
+                    game_history.game_priority = 1.0
 
         self.buffer[self.num_played_games] = game_history
         self.num_played_games += 1
@@ -163,13 +167,27 @@ class ReplayBuffer:
             game_probs = []
             for game_id, game_history in self.buffer.items():
                 game_id_list.append(game_id)
-                game_probs.append(game_history.game_priority)
+                game_probs.append(max(game_history.game_priority, 1e-8))  # Ensure no zeros
             game_probs = numpy.array(game_probs, dtype="float32")
-            game_probs /= numpy.sum(game_probs)
-            game_prob_dict = dict(
-                [(game_id, prob) for game_id, prob in zip(game_id_list, game_probs)]
-            )
-            selected_games = numpy.random.choice(game_id_list, n_games, p=game_probs)
+            
+            # Handle potential NaN values
+            if numpy.isnan(game_probs).any():
+                print("Warning: NaN detected in game priorities. Using uniform sampling instead.")
+                selected_games = numpy.random.choice(list(self.buffer.keys()), n_games)
+                game_prob_dict = {}
+            else:
+                # Safe normalization
+                sum_probs = numpy.sum(game_probs)
+                if sum_probs <= 0:
+                    # If sum is 0 or negative, use uniform distribution
+                    game_probs = numpy.ones_like(game_probs) / len(game_probs)
+                else:
+                    game_probs = game_probs / sum_probs
+                
+                game_prob_dict = dict(
+                    [(game_id, prob) for game_id, prob in zip(game_id_list, game_probs)]
+                )
+                selected_games = numpy.random.choice(game_id_list, n_games, p=game_probs)
         else:
             selected_games = numpy.random.choice(list(self.buffer.keys()), n_games)
             game_prob_dict = {}
@@ -186,9 +204,14 @@ class ReplayBuffer:
         """
         position_prob = None
         if self.config.PER and not force_uniform:
-            position_probs = game_history.priorities / sum(game_history.priorities)
-            position_index = numpy.random.choice(len(position_probs), p=position_probs)
-            position_prob = position_probs[position_index]
+            # Handle potential NaN or zero sum priorities
+            priorities = numpy.array(game_history.priorities, dtype="float32")
+            if numpy.isnan(priorities).any() or numpy.sum(priorities) <= 0:
+                position_index = numpy.random.choice(len(game_history.root_values))
+            else:
+                position_probs = priorities / numpy.sum(priorities)
+                position_index = numpy.random.choice(len(position_probs), p=position_probs)
+                position_prob = position_probs[position_index]
         else:
             position_index = numpy.random.choice(len(game_history.root_values))
 
