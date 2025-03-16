@@ -94,3 +94,12 @@ dmypy.json
 
 
 private_key.pem
+
+# MuZero specific files
+wandb/
+*.pth
+*.pkl
+*.checkpoint
+*.log
+results/
+*/*/*.checkpoint
