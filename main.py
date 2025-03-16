@@ -6,7 +6,7 @@ def main():
     # Initialize wandb with more detailed configuration
     wandb.init(
         project="muzero-boop",
-        name="muzero-boop-test-run",
+        name="muzero-boop-simple-test",
         config={
             "game": "boop",
             "num_simulations": 50,
@@ -20,7 +20,9 @@ def main():
             "replay_buffer_size": 1000,
             "test_run": True,
             "threefold_repetition_rule": True,
-            "max_moves": 50
+            "max_moves": 50,
+            "rules_version": "simplified",
+            "rules_notes": "Using simplified version without Cats/Kittens distinction and line-of-two protection"
         }
     )
     

@@ -264,9 +264,19 @@ class Game(AbstractGame):
 
 class Boop:
     """
-    The Boop game.
+    The Boop game - Simplified Version.
     A 6x6 board where players place their pieces and try to create three in a row.
     When a piece is placed next to another piece, it "boops" (pushes) that piece in the opposite direction.
+    
+    Note: This is a simplified implementation of the game. The official rules include:
+    1. Line of Two Protection: When any two pieces are in a line, pieces in that line cannot be booped
+    2. Kittens vs Cats: Two types of pieces with different abilities
+       - Kittens: Regular pieces that can be booped by any piece
+       - Cats: Advanced pieces that can only be booped by other Cats
+    3. Graduation: When three Kittens are aligned, they graduate into a Cat
+    4. Winning: Achieve three Cats in a row OR have all 8 Cats on the board
+    
+    Future implementation will add these additional rules.
     """
 
     def __init__(self):
@@ -438,6 +448,9 @@ class Boop:
     def check_win(self):
         """
         Check if the current player has won by getting three in a row.
+        
+        Note: In the official rules, winning requires three Cats in a row or all 8 Cats on the board.
+        This simplified version just requires three pieces in a row of any type.
         """
         # Check rows
         for r in range(self.board_size):
