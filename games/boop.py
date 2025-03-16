@@ -32,7 +32,7 @@ class MuZeroConfig:
         self.num_workers = 4  # Increased for faster self-play
         self.selfplay_on_gpu = True  # Utilize GPU for self-play
         self.max_moves = 100  # Maximum number of moves if game is not finished before
-        self.num_simulations = 150  # Increased from 50 to 150 for deeper search
+        self.num_simulations = 100  # Increased from 50 to 100 for deeper search
         self.discount = 1.0  # Board game with final reward
         self.temperature_threshold = 10  # Apply temperature reduction after 10 moves
 
