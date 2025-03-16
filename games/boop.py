@@ -152,8 +152,13 @@ class Game(AbstractGame):
         """
         if not hasattr(self, 'game_count'):
             self.game_count = 0
+            self.draw_by_repetition_count = 0
         else:
             self.game_count += 1
+            
+        # Check if game ended by repetition
+        if self.env.board_history and self.env.check_threefold_repetition():
+            self.draw_by_repetition_count += 1
             
         # Create a visual representation of the board
         board_size = self.env.board_size
@@ -169,10 +174,17 @@ class Game(AbstractGame):
                 else:
                     board_image[r, c] = [255, 255, 255]  # White for empty
         
-        # Log the board state
+        # Calculate draw by repetition rate
+        repetition_rate = (self.draw_by_repetition_count / self.game_count) * 100 if self.game_count > 0 else 0
+        
+        # Log the board state and statistics
         wandb.log({
             f"game_board_{self.game_count}": wandb.Image(board_image, 
-                                                         caption=f"Game {self.game_count} - Final Board State")
+                                                         caption=f"Game {self.game_count} - Final Board State"),
+            "total_games": self.game_count,
+            "draws_by_repetition": self.draw_by_repetition_count,
+            "repetition_rate": repetition_rate,
+            "move_count": self.env.move_count
         })
 
     def to_play(self):
@@ -264,6 +276,8 @@ class Boop:
         self.done = False
         self.move_count = 0
         self.directions = [(0, 1), (1, 0), (0, -1), (-1, 0), (1, 1), (-1, -1), (1, -1), (-1, 1)]  # All 8 directions
+        # Track board state history for repetition detection
+        self.board_history = []
 
     def to_play(self):
         """
@@ -279,6 +293,7 @@ class Boop:
         self.player = 0
         self.done = False
         self.move_count = 0
+        self.board_history = []
         return self.get_observation()
 
     def step(self, action):
@@ -299,10 +314,20 @@ class Boop:
         # Apply "boop" (push) mechanics
         self.apply_boops(row, col)
 
+        # Add current board state to history (store as hashable tuple)
+        board_state = self.get_board_state_hash()
+        self.board_history.append(board_state)
+        
+        # Check for repetitions (threefold repetition rule)
+        is_draw_by_repetition = self.check_threefold_repetition()
+
         # Check for three in a row
         reward = 0
         if self.check_win():
             reward = 1
+            self.done = True
+        elif is_draw_by_repetition:
+            # Game is a draw by repetition
             self.done = True
         elif self.is_board_full():
             self.done = True  # Draw
@@ -318,6 +343,24 @@ class Boop:
             self.done = True
 
         return self.get_observation(), reward, self.done
+
+    def get_board_state_hash(self):
+        """
+        Convert current board state to a hashable representation for repetition detection.
+        """
+        # Create a tuple representation of the board and current player
+        # This can be used as a dictionary key for tracking repeated positions
+        player_board = tuple(map(tuple, self.board[0].tolist()))
+        opponent_board = tuple(map(tuple, self.board[1].tolist()))
+        return (player_board, opponent_board, self.player)
+    
+    def check_threefold_repetition(self):
+        """
+        Check if the current board state has appeared three times.
+        """
+        current_state = self.get_board_state_hash()
+        repetition_count = sum(1 for state in self.board_history if state == current_state)
+        return repetition_count >= 3
 
     def apply_boops(self, row, col):
         """

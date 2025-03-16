@@ -18,7 +18,9 @@ def main():
             "blocks": 4,
             "channels": 64,
             "replay_buffer_size": 1000,
-            "test_run": True
+            "test_run": True,
+            "threefold_repetition_rule": True,
+            "max_moves": 50
         }
     )
     
