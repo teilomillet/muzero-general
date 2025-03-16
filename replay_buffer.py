@@ -114,12 +114,26 @@ class ReplayBuffer:
                 * len(actions)
             )
             if self.config.PER:
-                weight_batch.append(1 / (self.total_samples * game_prob * pos_prob))
+                # Add safe handling for None or NaN values
+                if game_prob is None or pos_prob is None or numpy.isnan(game_prob) or numpy.isnan(pos_prob):
+                    # Fall back to a default weight if probabilities are invalid
+                    weight_batch.append(1.0)
+                    if game_prob is None or numpy.isnan(game_prob):
+                        print(f"Warning: game_prob is {'None' if game_prob is None else 'NaN'} for game {game_id}")
+                    if pos_prob is None or numpy.isnan(pos_prob):
+                        print(f"Warning: pos_prob is {'None' if pos_prob is None else 'NaN'} for position {game_pos} in game {game_id}")
+                else:
+                    weight_batch.append(1 / (self.total_samples * game_prob * pos_prob))
 
         if self.config.PER:
-            weight_batch = numpy.array(weight_batch, dtype="float32") / max(
-                weight_batch
-            )
+            # Ensure weights are valid
+            if len(weight_batch) == 0:
+                # If we somehow have no valid weights, use uniform weights
+                weight_batch = numpy.ones(len(index_batch), dtype="float32")
+            else:
+                # Normalize weights
+                max_weight = max(weight_batch) if weight_batch else 1.0
+                weight_batch = numpy.array(weight_batch, dtype="float32") / max_weight
 
         # observation_batch: batch, channels, height, width
         # action_batch: batch, num_unroll_steps+1
@@ -152,11 +166,26 @@ class ReplayBuffer:
                 [game_history.game_priority for game_history in self.buffer.values()],
                 dtype="float32",
             )
-            game_probs /= numpy.sum(game_probs)
-            game_index = numpy.random.choice(len(self.buffer), p=game_probs)
-            game_prob = game_probs[game_index]
-        else:
+            
+            # Check for NaN values in game_probs
+            if numpy.isnan(game_probs).any():
+                print("Warning: NaN detected in game priorities. Using uniform sampling instead.")
+                force_uniform = True
+            else:
+                # Make sure the sum is not zero
+                sum_probs = numpy.sum(game_probs)
+                if sum_probs <= 0:
+                    print("Warning: Sum of game priorities is zero or negative. Using uniform sampling instead.")
+                    force_uniform = True
+                else:
+                    game_probs /= sum_probs
+                    game_index = numpy.random.choice(len(self.buffer), p=game_probs)
+                    game_prob = game_probs[game_index]
+        
+        if force_uniform or game_prob is None:
             game_index = numpy.random.choice(len(self.buffer))
+            game_prob = 1.0 / len(self.buffer)  # Uniform probability
+            
         game_id = self.num_played_games - len(self.buffer) + game_index
 
         return game_id, self.buffer[game_id], game_prob
@@ -167,35 +196,43 @@ class ReplayBuffer:
             game_probs = []
             for game_id, game_history in self.buffer.items():
                 game_id_list.append(game_id)
-                game_probs.append(max(game_history.game_priority, 1e-8))  # Ensure no zeros
+                # Ensure priorities are positive and not too close to zero
+                priority = max(game_history.game_priority, 1e-8)
+                # Check for NaN values
+                if numpy.isnan(priority):
+                    priority = 1e-8
+                game_probs.append(priority)
+            
+            # Convert to numpy array for vectorized operations
             game_probs = numpy.array(game_probs, dtype="float32")
             
-            # Handle potential NaN values
-            if numpy.isnan(game_probs).any():
-                print("Warning: NaN detected in game priorities. Using uniform sampling instead.")
-                selected_games = numpy.random.choice(list(self.buffer.keys()), n_games)
-                game_prob_dict = {}
+            # Check for invalid values in game_probs
+            if numpy.isnan(game_probs).any() or numpy.sum(game_probs) <= 0:
+                print("Warning: Invalid game priorities detected. Using uniform sampling instead.")
+                force_uniform = True
             else:
-                # Safe normalization
-                sum_probs = numpy.sum(game_probs)
-                if sum_probs <= 0:
-                    # If sum is 0 or negative, use uniform distribution
-                    game_probs = numpy.ones_like(game_probs) / len(game_probs)
-                else:
-                    game_probs = game_probs / sum_probs
+                # Normalize to get probabilities
+                game_probs = game_probs / numpy.sum(game_probs)
                 
-                game_prob_dict = dict(
-                    [(game_id, prob) for game_id, prob in zip(game_id_list, game_probs)]
+                # Sample indices according to priorities
+                game_indices = numpy.random.choice(
+                    len(game_id_list), n_games, p=game_probs, replace=True
                 )
-                selected_games = numpy.random.choice(game_id_list, n_games, p=game_probs)
-        else:
-            selected_games = numpy.random.choice(list(self.buffer.keys()), n_games)
-            game_prob_dict = {}
-        ret = [
-            (game_id, self.buffer[game_id], game_prob_dict.get(game_id))
-            for game_id in selected_games
+                
+                return [
+                    (game_id_list[index], self.buffer[game_id_list[index]], game_probs[index])
+                    for index in game_indices
+                ]
+        
+        # Uniform sampling (fallback or if PER is disabled)
+        game_indices = numpy.random.choice(len(self.buffer), n_games, replace=True)
+        game_id_list = list(self.buffer.keys())
+        uniform_prob = 1.0 / len(self.buffer)
+        
+        return [
+            (game_id_list[index], self.buffer[game_id_list[index]], uniform_prob)
+            for index in game_indices
         ]
-        return ret
 
     def sample_position(self, game_history, force_uniform=False):
         """
@@ -203,18 +240,29 @@ class ReplayBuffer:
         See paper appendix Training.
         """
         position_prob = None
-        if self.config.PER and not force_uniform:
-            # Handle potential NaN or zero sum priorities
-            priorities = numpy.array(game_history.priorities, dtype="float32")
-            if numpy.isnan(priorities).any() or numpy.sum(priorities) <= 0:
-                position_index = numpy.random.choice(len(game_history.root_values))
+        if self.config.PER and not force_uniform and game_history.priorities is not None:
+            # Add a small value to avoid zero priorities
+            priorities = numpy.array(game_history.priorities, dtype="float32") + 1e-6
+            
+            # Check for NaN values in priorities
+            if numpy.isnan(priorities).any():
+                print("Warning: NaN detected in position priorities. Using uniform sampling instead.")
+                force_uniform = True
             else:
-                position_probs = priorities / numpy.sum(priorities)
-                position_index = numpy.random.choice(len(position_probs), p=position_probs)
-                position_prob = position_probs[position_index]
-        else:
+                # Ensure sum is positive
+                sum_priorities = numpy.sum(priorities)
+                if sum_priorities <= 0:
+                    print("Warning: Sum of position priorities is zero or negative. Using uniform sampling instead.")
+                    force_uniform = True
+                else:
+                    priorities /= sum_priorities
+                    position_index = numpy.random.choice(len(priorities), p=priorities)
+                    position_prob = priorities[position_index]
+        
+        if force_uniform or position_prob is None:
             position_index = numpy.random.choice(len(game_history.root_values))
-
+            position_prob = 1 / len(game_history.root_values)
+            
         return position_index, position_prob
 
     def update_game_history(self, game_id, game_history):
@@ -228,27 +276,56 @@ class ReplayBuffer:
     def update_priorities(self, priorities, index_info):
         """
         Update game and position priorities with priorities calculated during the training.
-        See Distributed Prioritized Experience Replay https://arxiv.org/abs/1803.00933
+        See Appendix Training.
         """
+        # Clamp priorities to be positive and not NaN
+        for i, priority in enumerate(priorities):
+            # Check if any element is NaN or if any element is less than or equal to 0
+            if (numpy.isnan(priority).any() if isinstance(priority, numpy.ndarray) else numpy.isnan(priority)) or \
+               ((priority <= 0).any() if isinstance(priority, numpy.ndarray) else priority <= 0):
+                print(f"Warning: Invalid priority detected. Using default priority.")
+                priorities[i] = 1.0
+            
         for i in range(len(index_info)):
             game_id, game_pos = index_info[i]
-
-            # The element could have been removed since its selection and training
-            if next(iter(self.buffer)) <= game_id:
+            
+            # Ensure the game exists
+            if game_id in self.buffer:
                 # Update position priorities
-                priority = priorities[i, :]
-                start_index = game_pos
-                end_index = min(
-                    game_pos + len(priority), len(self.buffer[game_id].priorities)
-                )
-                self.buffer[game_id].priorities[start_index:end_index] = priority[
-                    : end_index - start_index
-                ]
-
+                if self.buffer[game_id].priorities is None:
+                    self.buffer[game_id].priorities = [1 for _ in range(len(self.buffer[game_id].root_values))]
+                    
+                # Ensure the position is valid
+                if 0 <= game_pos < len(self.buffer[game_id].priorities):
+                    # Extract scalar value from priority if it's an array
+                    priority_value = priorities[i]
+                    if isinstance(priority_value, numpy.ndarray):
+                        if priority_value.size > 0:
+                            # Take the first element if it's a non-empty array
+                            priority_value = float(priority_value.flat[0])
+                        else:
+                            # Default value for empty arrays
+                            priority_value = 1.0
+                            print(f"Warning: Empty priority array for game {game_id}, position {game_pos}")
+                    
+                    # Ensure it's a scalar value
+                    try:
+                        priority_value = float(priority_value)
+                        if numpy.isnan(priority_value):
+                            priority_value = 1.0
+                    except (TypeError, ValueError):
+                        print(f"Warning: Invalid priority type for game {game_id}, position {game_pos}. Using default value.")
+                        priority_value = 1.0
+                        
+                    self.buffer[game_id].priorities[game_pos] = priority_value
+                    
                 # Update game priorities
-                self.buffer[game_id].game_priority = numpy.max(
-                    self.buffer[game_id].priorities
-                )
+                if self.buffer[game_id].priorities is not None and len(self.buffer[game_id].priorities) > 0:
+                    valid_priorities = [p for p in self.buffer[game_id].priorities if not numpy.isnan(p) and p > 0]
+                    if valid_priorities:
+                        self.buffer[game_id].game_priority = numpy.max(valid_priorities)
+                    else:
+                        self.buffer[game_id].game_priority = 1.0
 
     def compute_target_value(self, game_history, index):
         # The value target is the discounted root value of the search tree td_steps into the

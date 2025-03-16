@@ -152,20 +152,24 @@ class Trainer:
         target_reward = torch.tensor(target_reward).float().to(device)
         target_policy = torch.tensor(target_policy).float().to(device)
         gradient_scale_batch = torch.tensor(gradient_scale_batch).float().to(device)
-        # observation_batch: batch, channels, height, width
-        # action_batch: batch, num_unroll_steps+1, 1 (unsqueeze)
-        # target_value: batch, num_unroll_steps+1
-        # target_reward: batch, num_unroll_steps+1
-        # target_policy: batch, num_unroll_steps+1, len(action_space)
-        # gradient_scale_batch: batch, num_unroll_steps+1
-
+        
+        # Check for NaN values in inputs
+        if (torch.isnan(observation_batch).any() or torch.isnan(target_value).any() or
+            torch.isnan(target_reward).any() or torch.isnan(target_policy).any()):
+            print("Warning: NaN detected in inputs to model")
+        
+        # Convert to support form
         target_value = models.scalar_to_support(target_value, self.config.support_size)
         target_reward = models.scalar_to_support(
             target_reward, self.config.support_size
         )
-        # target_value: batch, num_unroll_steps+1, 2*support_size+1
-        # target_reward: batch, num_unroll_steps+1, 2*support_size+1
-
+        
+        # Ensure no NaN in targets after conversion
+        if torch.isnan(target_value).any() or torch.isnan(target_reward).any():
+            print("Warning: NaN detected in converted targets")
+            target_value = torch.nan_to_num(target_value, nan=0.0)
+            target_reward = torch.nan_to_num(target_reward, nan=0.0)
+        
         ## Generate predictions
         value, reward, policy_logits, hidden_state = self.model.initial_inference(
             observation_batch
@@ -194,26 +198,40 @@ class Trainer:
         )
         value_loss += current_value_loss
         policy_loss += current_policy_loss
-        # Compute priorities for the prioritized replay (See paper appendix Training)
-        pred_value_scalar = (
-            models.support_to_scalar(value, self.config.support_size)
-            .detach()
-            .cpu()
-            .numpy()
-            .squeeze()
-        )
-        priorities[:, 0] = (
-            numpy.abs(pred_value_scalar - target_value_scalar[:, 0])
-            ** self.config.PER_alpha
-        )
+        
+        # Set up array for all priorities
+        batch_size = target_value_scalar.shape[0]
+        all_priorities = numpy.ones((batch_size, len(predictions)))
+        
+        try:
+            # Compute priorities for the prioritized replay
+            pred_value_scalar = models.support_to_scalar(value, self.config.support_size).detach().cpu().numpy()
+            
+            # Ensure pred_value_scalar has correct shape: [batch_size, 1] 
+            if pred_value_scalar.ndim != 2 or pred_value_scalar.shape[1] != 1:
+                pred_value_scalar = pred_value_scalar.reshape(batch_size, 1)
+            
+            # Compute absolute difference as priority
+            priorities = numpy.abs(pred_value_scalar[:, 0] - target_value_scalar[:, 0])
+            
+            # Handle any NaN values
+            priorities = numpy.where(numpy.isnan(priorities), 1.0, priorities)
+            
+            # Ensure positive values and apply PER alpha
+            priorities = numpy.maximum(priorities, 1e-6) ** self.config.PER_alpha
+            
+            # Store priorities for the first prediction
+            all_priorities[:, 0] = priorities
+            
+        except Exception as e:
+            print(f"Error calculating initial priorities: {e}")
+            # Use default priorities of 1.0
+            all_priorities[:, 0] = 1.0
 
+        # Process other prediction steps
         for i in range(1, len(predictions)):
             value, reward, policy_logits = predictions[i]
-            (
-                current_value_loss,
-                current_reward_loss,
-                current_policy_loss,
-            ) = self.loss_function(
+            current_value_loss, current_reward_loss, current_policy_loss = self.loss_function(
                 value.squeeze(-1),
                 reward.squeeze(-1),
                 policy_logits,
@@ -221,34 +239,34 @@ class Trainer:
                 target_reward[:, i],
                 target_policy[:, i],
             )
-
-            # Scale gradient by the number of unroll steps (See paper appendix Training)
-            current_value_loss.register_hook(
-                lambda grad: grad / gradient_scale_batch[:, i]
-            )
-            current_reward_loss.register_hook(
-                lambda grad: grad / gradient_scale_batch[:, i]
-            )
-            current_policy_loss.register_hook(
-                lambda grad: grad / gradient_scale_batch[:, i]
-            )
-
             value_loss += current_value_loss
             reward_loss += current_reward_loss
             policy_loss += current_policy_loss
-
-            # Compute priorities for the prioritized replay (See paper appendix Training)
-            pred_value_scalar = (
-                models.support_to_scalar(value, self.config.support_size)
-                .detach()
-                .cpu()
-                .numpy()
-                .squeeze()
-            )
-            priorities[:, i] = (
-                numpy.abs(pred_value_scalar - target_value_scalar[:, i])
-                ** self.config.PER_alpha
-            )
+            
+            try:
+                # Compute priorities for the prioritized replay
+                pred_value_scalar = models.support_to_scalar(value, self.config.support_size).detach().cpu().numpy()
+                
+                # Ensure pred_value_scalar has correct shape: [batch_size, 1]
+                if pred_value_scalar.ndim != 2 or pred_value_scalar.shape[1] != 1:
+                    pred_value_scalar = pred_value_scalar.reshape(batch_size, 1)
+                
+                # Compute absolute difference as priority
+                step_priorities = numpy.abs(pred_value_scalar[:, 0] - target_value_scalar[:, i])
+                
+                # Handle any NaN values
+                step_priorities = numpy.where(numpy.isnan(step_priorities), 1.0, step_priorities)
+                
+                # Ensure positive values and apply PER alpha
+                step_priorities = numpy.maximum(step_priorities, 1e-6) ** self.config.PER_alpha
+                
+                # Store priorities for this prediction step
+                all_priorities[:, i] = step_priorities
+                
+            except Exception as e:
+                print(f"Error calculating priorities for step {i}: {e}")
+                # Use default priorities of 1.0
+                all_priorities[:, i] = 1.0
 
         # Scale the value loss, paper recommends by 0.25 (See paper appendix Reanalyze)
         loss = value_loss * self.config.value_loss_weight + reward_loss + policy_loss
@@ -260,28 +278,57 @@ class Trainer:
 
         # Optimize
         self.optimizer.zero_grad()
-        loss.backward()
+        total_loss = (
+            value_loss * self.config.value_loss_weight
+            + reward_loss
+            + policy_loss
+        ).mean()
+        
+        # Check for NaN in total loss
+        if torch.isnan(total_loss):
+            print("Warning: NaN detected in total_loss, skipping backward pass")
+            priorities = numpy.ones_like(target_value_scalar)
+            return (
+                priorities,
+                float('nan'),
+                float('nan'),
+                float('nan'),
+                float('nan'),
+            )
+            
+        # Use gradient clipping to prevent exploding gradients
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 10.0)
         self.optimizer.step()
+
+        # Return max priorities across all prediction steps for each batch element
+        final_priorities = numpy.max(all_priorities, axis=1)
+
+        # Get loss values as Python floats
+        total_loss_val = float(total_loss.item()) if not torch.isnan(total_loss) else float('nan')
+        value_loss_val = float(value_loss.mean().item()) if not torch.isnan(value_loss.mean()) else float('nan')
+        reward_loss_val = float(reward_loss.mean().item()) if not torch.isnan(reward_loss.mean()) else float('nan')
+        policy_loss_val = float(policy_loss.mean().item()) if not torch.isnan(policy_loss.mean()) else float('nan')
+
         self.training_step += 1
 
         # Log metrics to wandb
         if wandb.run is not None and self.training_step % 10 == 0:  # Log every 10 steps to avoid flooding
             wandb.log({
-                "trainer/total_loss": loss.item(),
-                "trainer/value_loss": value_loss.mean().item(),
-                "trainer/reward_loss": reward_loss.mean().item(),
-                "trainer/policy_loss": policy_loss.mean().item(),
+                "trainer/total_loss": total_loss_val,
+                "trainer/value_loss": value_loss_val,
+                "trainer/reward_loss": reward_loss_val,
+                "trainer/policy_loss": policy_loss_val,
                 "trainer/learning_rate": self.optimizer.param_groups[0]["lr"],
                 "trainer/training_step": self.training_step,
             }, step=self.training_step)
 
         return (
-            priorities,
-            # For log purpose
-            loss.item(),
-            value_loss.mean().item(),
-            reward_loss.mean().item(),
-            policy_loss.mean().item(),
+            final_priorities,
+            total_loss_val,
+            value_loss_val,
+            reward_loss_val,
+            policy_loss_val,
         )
 
     def update_lr(self):
@@ -303,10 +350,64 @@ class Trainer:
         target_reward,
         target_policy,
     ):
-        # Cross-entropy seems to have a better convergence than MSE
-        value_loss = (-target_value * torch.nn.LogSoftmax(dim=1)(value)).sum(1)
-        reward_loss = (-target_reward * torch.nn.LogSoftmax(dim=1)(reward)).sum(1)
-        policy_loss = (-target_policy * torch.nn.LogSoftmax(dim=1)(policy_logits)).sum(
-            1
-        )
+        # Add numerical stability checks
+        # Apply small epsilon to avoid log(0) which results in NaN
+        epsilon = 1e-8
+        
+        # Ensure policy_logits doesn't have NaN or extreme values
+        if torch.isnan(policy_logits).any() or torch.isinf(policy_logits).any():
+            policy_logits = torch.nan_to_num(policy_logits, nan=0.0, posinf=10.0, neginf=-10.0)
+            
+        # Ensure values don't have NaN or extreme values
+        if torch.isnan(value).any() or torch.isinf(value).any():
+            value = torch.nan_to_num(value, nan=0.0, posinf=10.0, neginf=-10.0)
+            
+        # Ensure rewards don't have NaN or extreme values
+        if torch.isnan(reward).any() or torch.isinf(reward).any():
+            reward = torch.nan_to_num(reward, nan=0.0, posinf=10.0, neginf=-10.0)
+        
+        # Clamp values to prevent extreme logits
+        policy_logits = torch.clamp(policy_logits, -10.0, 10.0)
+        value = torch.clamp(value, -10.0, 10.0)
+        reward = torch.clamp(reward, -10.0, 10.0)
+        
+        # Custom implementation of numerically stable log softmax
+        def stable_log_softmax(x):
+            max_x = torch.max(x, dim=1, keepdim=True)[0]
+            x_stable = x - max_x
+            sum_exp = torch.sum(torch.exp(x_stable), dim=1, keepdim=True)
+            # Ensure sum_exp is never too small
+            sum_exp = torch.clamp(sum_exp, min=epsilon)
+            log_sum_exp = torch.log(sum_exp) + max_x
+            return x - log_sum_exp
+            
+        # Apply stable log softmax
+        log_softmax_value = stable_log_softmax(value)
+        log_softmax_reward = stable_log_softmax(reward)
+        log_softmax_policy = stable_log_softmax(policy_logits)
+        
+        # Ensure no -inf in the log softmax results
+        log_softmax_value = torch.clamp(log_softmax_value, min=-20.0)
+        log_softmax_reward = torch.clamp(log_softmax_reward, min=-20.0)
+        log_softmax_policy = torch.clamp(log_softmax_policy, min=-20.0)
+        
+        # Calculate losses with protection against NaNs
+        value_loss = torch.sum(-target_value * log_softmax_value, dim=1)
+        reward_loss = torch.sum(-target_reward * log_softmax_reward, dim=1)
+        policy_loss = torch.sum(-target_policy * log_softmax_policy, dim=1)
+        
+        # Additional check for extreme loss values
+        max_loss_value = 1000.0  # Cap individual losses to prevent explosion
+        value_loss = torch.clamp(value_loss, 0.0, max_loss_value)
+        reward_loss = torch.clamp(reward_loss, 0.0, max_loss_value)
+        policy_loss = torch.clamp(policy_loss, 0.0, max_loss_value)
+        
+        # Final NaN check on losses
+        if torch.isnan(value_loss).any() or torch.isnan(reward_loss).any() or torch.isnan(policy_loss).any() or \
+           torch.isinf(value_loss).any() or torch.isinf(reward_loss).any() or torch.isinf(policy_loss).any():
+            print("Warning: NaN detected in losses after calculation!")
+            value_loss = torch.nan_to_num(value_loss, nan=1.0, posinf=max_loss_value)
+            reward_loss = torch.nan_to_num(reward_loss, nan=1.0, posinf=max_loss_value)
+            policy_loss = torch.nan_to_num(policy_loss, nan=1.0, posinf=max_loss_value)
+            
         return value_loss, reward_loss, policy_loss

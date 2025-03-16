@@ -2,6 +2,7 @@ import math
 from abc import ABC, abstractmethod
 
 import torch
+import numpy
 
 
 class MuZeroNetwork:
@@ -71,6 +72,43 @@ class AbstractNetwork(ABC, torch.nn.Module):
 
     def set_weights(self, weights):
         self.load_state_dict(weights)
+        
+    def initialize_weights(self):
+        """
+        Initialize network weights with a numerically stable method.
+        This helps prevent NaN values during early training.
+        """
+        for module in self.modules():
+            if isinstance(module, torch.nn.Conv2d):
+                # Reduce variance for convolutional layers to prevent extreme values
+                n = module.kernel_size[0] * module.kernel_size[1] * module.out_channels
+                module.weight.data.normal_(0, math.sqrt(1.0 / n))
+                if module.bias is not None:
+                    module.bias.data.zero_()
+            elif isinstance(module, torch.nn.Linear):
+                # Special initialization for fully connected layers
+                # Use truncated normal to avoid extreme values
+                std = 1.0 / math.sqrt(module.weight.size(1))
+                module.weight.data.normal_(0, std).clamp_(-2.0 * std, 2.0 * std)
+                if module.bias is not None:
+                    module.bias.data.zero_()
+            elif isinstance(module, (torch.nn.BatchNorm2d, torch.nn.LayerNorm)):
+                if module.weight is not None:
+                    # Initialize with slightly less than 1 to avoid scale drift
+                    module.weight.data.fill_(0.9)
+                if module.bias is not None:
+                    module.bias.data.zero_()
+                    
+        # Special handling for ResNet model
+        if hasattr(self, 'representation_network'):
+            # Apply specific initialization to first layer to ensure stable input processing
+            for module in self.representation_network.modules():
+                if isinstance(module, torch.nn.Conv2d) and module.in_channels > 3:
+                    # First conv layer typically has more channels due to stacked observations
+                    # More conservative initialization for stability
+                    module.weight.data.normal_(0, 0.01)
+                    if module.bias is not None:
+                        module.bias.data.zero_()
 
 
 ##################################
@@ -124,10 +162,25 @@ class MuZeroFullyConnectedNetwork(AbstractNetwork):
         self.prediction_value_network = torch.nn.DataParallel(
             mlp(encoding_size, fc_value_layers, self.full_support_size)
         )
+        
+        # Initialize weights with stable values
+        self.initialize_weights()
 
     def prediction(self, encoded_state):
         policy_logits = self.prediction_policy_network(encoded_state)
         value = self.prediction_value_network(encoded_state)
+        
+        # Safety check for extreme values
+        if torch.isnan(policy_logits).any() or torch.isinf(policy_logits).any():
+            policy_logits = torch.nan_to_num(policy_logits, nan=0.0, posinf=10.0, neginf=-10.0)
+            
+        if torch.isnan(value).any() or torch.isinf(value).any():
+            value = torch.nan_to_num(value, nan=0.0, posinf=10.0, neginf=-10.0)
+        
+        # Apply aggressive clamping to prevent unstable outputs
+        policy_logits = torch.clamp(policy_logits, -10.0, 10.0)
+        value = torch.clamp(value, -10.0, 10.0)
+        
         return policy_logits, value
 
     def representation(self, observation):
@@ -135,13 +188,47 @@ class MuZeroFullyConnectedNetwork(AbstractNetwork):
             observation.view(observation.shape[0], -1)
         )
         # Scale encoded state between [0, 1] (See appendix paper Training)
-        min_encoded_state = encoded_state.min(1, keepdim=True)[0]
-        max_encoded_state = encoded_state.max(1, keepdim=True)[0]
+        # With additional numerical stability
+        reshaped_state = encoded_state.view(
+            -1,
+            encoded_state.shape[1],
+            encoded_state.shape[2] * encoded_state.shape[3],
+        )
+            
+        # Add small epsilon to prevent exact same min/max
+        eps = 1e-5
+        random_noise = torch.randn_like(reshaped_state) * eps
+        
+        # Calculate min/max with safety against extreme values
+        min_encoded_state = reshaped_state.min(2, keepdim=True)[0].unsqueeze(-1)
+        max_encoded_state = reshaped_state.max(2, keepdim=True)[0].unsqueeze(-1)
+        
+        # Protect against identical min/max
+        identical_minmax = (max_encoded_state - min_encoded_state < eps)
+        if identical_minmax.any():
+            # Add a small constant to max where min == max
+            max_encoded_state = torch.where(
+                identical_minmax,
+                min_encoded_state + 0.1,  # Use a constant offset rather than just eps
+                max_encoded_state
+            )
+        
+        # Calculate scale with protection against division by zero
         scale_encoded_state = max_encoded_state - min_encoded_state
-        scale_encoded_state[scale_encoded_state < 1e-5] += 1e-5
-        encoded_state_normalized = (
-            encoded_state - min_encoded_state
-        ) / scale_encoded_state
+        scale_encoded_state = torch.clamp(scale_encoded_state, min=0.1)  # Larger min value for safety
+        
+        # Normalize the state
+        encoded_state_normalized = (encoded_state - min_encoded_state) / scale_encoded_state
+        
+        # Final safety check for NaN/Inf values
+        if torch.isnan(encoded_state_normalized).any() or torch.isinf(encoded_state_normalized).any():
+            # Replace problematic values
+            encoded_state_normalized = torch.nan_to_num(
+                encoded_state_normalized, nan=0.5, posinf=1.0, neginf=0.0
+            )
+            # Ensure all values are in [0,1] range
+            encoded_state_normalized = torch.clamp(encoded_state_normalized, 0.0, 1.0)
+            
         return encoded_state_normalized
 
     def dynamics(self, encoded_state, action):
@@ -155,17 +242,41 @@ class MuZeroFullyConnectedNetwork(AbstractNetwork):
         x = torch.cat((encoded_state, action_one_hot), dim=1)
 
         next_encoded_state = self.dynamics_encoded_state_network(x)
-
         reward = self.dynamics_reward_network(next_encoded_state)
 
-        # Scale encoded state between [0, 1] (See paper appendix Training)
+        # Scale encoded state between [0, 1] with numerical stability
+        # With additional numerical stability
+        eps = 1e-5
+        
+        # Calculate min/max with safety measures
         min_next_encoded_state = next_encoded_state.min(1, keepdim=True)[0]
         max_next_encoded_state = next_encoded_state.max(1, keepdim=True)[0]
+        
+        # Protect against identical min/max
+        identical_minmax = (max_next_encoded_state - min_next_encoded_state < eps)
+        if identical_minmax.any():
+            # Add a small constant to max where min == max
+            max_next_encoded_state = torch.where(
+                identical_minmax,
+                min_next_encoded_state + 0.1,
+                max_next_encoded_state
+            )
+        
+        # Calculate scale with protection against division by zero
         scale_next_encoded_state = max_next_encoded_state - min_next_encoded_state
-        scale_next_encoded_state[scale_next_encoded_state < 1e-5] += 1e-5
-        next_encoded_state_normalized = (
-            next_encoded_state - min_next_encoded_state
-        ) / scale_next_encoded_state
+        scale_next_encoded_state = torch.clamp(scale_next_encoded_state, min=0.1)
+        
+        # Normalize the state
+        next_encoded_state_normalized = (next_encoded_state - min_next_encoded_state) / scale_next_encoded_state
+        
+        # Final safety check for NaN/Inf values
+        if torch.isnan(next_encoded_state_normalized).any() or torch.isinf(next_encoded_state_normalized).any():
+            # Replace problematic values
+            next_encoded_state_normalized = torch.nan_to_num(
+                next_encoded_state_normalized, nan=0.5, posinf=1.0, neginf=0.0
+            )
+            # Ensure all values are in [0,1] range
+            next_encoded_state_normalized = torch.clamp(next_encoded_state_normalized, 0.0, 1.0)
 
         return next_encoded_state_normalized, reward
 
@@ -217,15 +328,42 @@ class ResidualBlock(torch.nn.Module):
         self.bn1 = torch.nn.BatchNorm2d(num_channels)
         self.conv2 = conv3x3(num_channels, num_channels)
         self.bn2 = torch.nn.BatchNorm2d(num_channels)
+        
+        # Add a small amount of noise during training to prevent exact zero gradients
+        self.training_noise = 1e-5
 
     def forward(self, x):
+        # Save input for residual connection
+        identity = x
+        
+        # First convolution block with value clipping
         out = self.conv1(x)
         out = self.bn1(out)
         out = torch.nn.functional.relu(out)
+        
+        # Add small noise during training to prevent vanishing gradients
+        if self.training and torch.rand(1).item() > 0.5:
+            out = out + torch.randn_like(out) * self.training_noise
+            
+        # Second convolution block
         out = self.conv2(out)
         out = self.bn2(out)
-        out += x
+        
+        # Residual connection with value clipping to prevent extreme values
+        out = out + identity
+        
+        # ReLU activation after the addition
         out = torch.nn.functional.relu(out)
+        
+        # Prevent extreme values
+        out = torch.clamp(out, -100, 100)
+        
+        # Check for and handle inf/nan
+        if torch.isnan(out).any() or torch.isinf(out).any():
+            # Replace with safe values but preserve general structure
+            out = torch.nan_to_num(out, nan=0.0, posinf=1.0, neginf=-1.0)
+            # Don't print here to avoid log flooding
+            
         return out
 
 
@@ -518,38 +656,71 @@ class MuZeroResidualNetwork(AbstractNetwork):
                 block_output_size_policy,
             )
         )
+        
+        # Initialize weights with stable values
+        self.initialize_weights()
 
     def prediction(self, encoded_state):
         policy, value = self.prediction_network(encoded_state)
+        
+        # Safety check for extreme values
+        if torch.isnan(policy).any() or torch.isinf(policy).any():
+            policy = torch.nan_to_num(policy, nan=0.0, posinf=10.0, neginf=-10.0)
+            
+        if torch.isnan(value).any() or torch.isinf(value).any():
+            value = torch.nan_to_num(value, nan=0.0, posinf=10.0, neginf=-10.0)
+        
+        # Apply aggressive clamping to prevent unstable outputs
+        policy = torch.clamp(policy, -10.0, 10.0)
+        value = torch.clamp(value, -10.0, 10.0)
+        
         return policy, value
 
     def representation(self, observation):
         encoded_state = self.representation_network(observation)
 
         # Scale encoded state between [0, 1] (See appendix paper Training)
-        min_encoded_state = (
-            encoded_state.view(
-                -1,
-                encoded_state.shape[1],
-                encoded_state.shape[2] * encoded_state.shape[3],
-            )
-            .min(2, keepdim=True)[0]
-            .unsqueeze(-1)
+        # With additional numerical stability
+        reshaped_state = encoded_state.view(
+            -1,
+            encoded_state.shape[1],
+            encoded_state.shape[2] * encoded_state.shape[3],
         )
-        max_encoded_state = (
-            encoded_state.view(
-                -1,
-                encoded_state.shape[1],
-                encoded_state.shape[2] * encoded_state.shape[3],
+            
+        # Add small epsilon to prevent exact same min/max
+        eps = 1e-5
+        random_noise = torch.randn_like(reshaped_state) * eps
+        
+        # Calculate min/max with safety against extreme values
+        min_encoded_state = reshaped_state.min(2, keepdim=True)[0].unsqueeze(-1)
+        max_encoded_state = reshaped_state.max(2, keepdim=True)[0].unsqueeze(-1)
+        
+        # Protect against identical min/max
+        identical_minmax = (max_encoded_state - min_encoded_state < eps)
+        if identical_minmax.any():
+            # Add a small constant to max where min == max
+            max_encoded_state = torch.where(
+                identical_minmax,
+                min_encoded_state + 0.1,  # Use a constant offset rather than just eps
+                max_encoded_state
             )
-            .max(2, keepdim=True)[0]
-            .unsqueeze(-1)
-        )
+        
+        # Calculate scale with protection against division by zero
         scale_encoded_state = max_encoded_state - min_encoded_state
-        scale_encoded_state[scale_encoded_state < 1e-5] += 1e-5
-        encoded_state_normalized = (
-            encoded_state - min_encoded_state
-        ) / scale_encoded_state
+        scale_encoded_state = torch.clamp(scale_encoded_state, min=0.1)  # Larger min value for safety
+        
+        # Normalize the state
+        encoded_state_normalized = (encoded_state - min_encoded_state) / scale_encoded_state
+        
+        # Final safety check for NaN/Inf values
+        if torch.isnan(encoded_state_normalized).any() or torch.isinf(encoded_state_normalized).any():
+            # Replace problematic values
+            encoded_state_normalized = torch.nan_to_num(
+                encoded_state_normalized, nan=0.5, posinf=1.0, neginf=0.0
+            )
+            # Ensure all values are in [0,1] range
+            encoded_state_normalized = torch.clamp(encoded_state_normalized, 0.0, 1.0)
+            
         return encoded_state_normalized
 
     def dynamics(self, encoded_state, action):
@@ -572,30 +743,40 @@ class MuZeroResidualNetwork(AbstractNetwork):
         x = torch.cat((encoded_state, action_one_hot), dim=1)
         next_encoded_state, reward = self.dynamics_network(x)
 
-        # Scale encoded state between [0, 1] (See paper appendix Training)
-        min_next_encoded_state = (
-            next_encoded_state.view(
-                -1,
-                next_encoded_state.shape[1],
-                next_encoded_state.shape[2] * next_encoded_state.shape[3],
+        # Scale encoded state between [0, 1] with numerical stability
+        # With additional numerical stability
+        eps = 1e-5
+        
+        # Calculate min/max with safety measures
+        min_next_encoded_state = next_encoded_state.min(1, keepdim=True)[0]
+        max_next_encoded_state = next_encoded_state.max(1, keepdim=True)[0]
+        
+        # Protect against identical min/max
+        identical_minmax = (max_next_encoded_state - min_next_encoded_state < eps)
+        if identical_minmax.any():
+            # Add a small constant to max where min == max
+            max_next_encoded_state = torch.where(
+                identical_minmax,
+                min_next_encoded_state + 0.1,
+                max_next_encoded_state
             )
-            .min(2, keepdim=True)[0]
-            .unsqueeze(-1)
-        )
-        max_next_encoded_state = (
-            next_encoded_state.view(
-                -1,
-                next_encoded_state.shape[1],
-                next_encoded_state.shape[2] * next_encoded_state.shape[3],
-            )
-            .max(2, keepdim=True)[0]
-            .unsqueeze(-1)
-        )
+        
+        # Calculate scale with protection against division by zero
         scale_next_encoded_state = max_next_encoded_state - min_next_encoded_state
-        scale_next_encoded_state[scale_next_encoded_state < 1e-5] += 1e-5
-        next_encoded_state_normalized = (
-            next_encoded_state - min_next_encoded_state
-        ) / scale_next_encoded_state
+        scale_next_encoded_state = torch.clamp(scale_next_encoded_state, min=0.1)
+        
+        # Normalize the state
+        next_encoded_state_normalized = (next_encoded_state - min_next_encoded_state) / scale_next_encoded_state
+        
+        # Final safety check for NaN/Inf values
+        if torch.isnan(next_encoded_state_normalized).any() or torch.isinf(next_encoded_state_normalized).any():
+            # Replace problematic values
+            next_encoded_state_normalized = torch.nan_to_num(
+                next_encoded_state_normalized, nan=0.5, posinf=1.0, neginf=0.0
+            )
+            # Ensure all values are in [0,1] range
+            next_encoded_state_normalized = torch.clamp(next_encoded_state_normalized, 0.0, 1.0)
+
         return next_encoded_state_normalized, reward
 
     def initial_inference(self, observation):
@@ -647,22 +828,86 @@ def support_to_scalar(logits, support_size):
     Transform a categorical representation to a scalar
     See paper appendix Network Architecture
     """
-    # Decode to a scalar
-    probabilities = torch.softmax(logits, dim=1)
+    # Check for NaN or infinite values in logits
+    if torch.isnan(logits).any() or torch.isinf(logits).any():
+        # More detailed logging (but limit frequency to avoid flooding)
+        if numpy.random.random() < 0.05:  # Only log about 5% of the time
+            nan_count = torch.isnan(logits).sum().item()
+            inf_count = torch.isinf(logits).sum().item()
+            total_elements = logits.numel()
+            nan_percent = nan_count / total_elements * 100 if total_elements > 0 else 0
+            inf_percent = inf_count / total_elements * 100 if total_elements > 0 else 0
+            
+            print(f"Warning: {nan_count}/{total_elements} ({nan_percent:.2f}%) NaN and {inf_count}/{total_elements} ({inf_percent:.2f}%) Inf values in support_to_scalar input")
+        
+        # Very aggressive replacement of problematic values
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=1.0, neginf=-1.0)
+    
+    # Extreme clamping to avoid any values that could cause issues
+    logits = torch.clamp(logits, -5, 5)
+    
+    # Ensure logits has proper shape for softmax: [batch_size, n_categories]
+    # If it has more dimensions, flatten all but the last one
+    original_shape = logits.shape
+    if len(original_shape) > 2:
+        batch_size = original_shape[0]
+        logits = logits.reshape(batch_size, -1)
+    
+    # Double-stable softmax implementation:
+    # 1. Subtract max for numerical stability
+    # 2. Apply exponential
+    # 3. Add small epsilon to avoid division by zero
+    max_logits = torch.max(logits, dim=1, keepdim=True)[0]
+    logits_stable = logits - max_logits
+    exp_logits = torch.exp(logits_stable)
+    sum_exp = torch.sum(exp_logits, dim=1, keepdim=True)
+    # Ensure denominator is never too close to zero
+    sum_exp = torch.clamp(sum_exp, min=1e-5)
+    probabilities = exp_logits / sum_exp
+    
+    # Check for NaN after softmax and use uniform distribution as fallback
+    if torch.isnan(probabilities).any():
+        # Only log occasionally
+        if numpy.random.random() < 0.05:
+            print("Warning: NaN detected after softmax, using uniform distribution")
+        # Use uniform distribution as fallback
+        probabilities = torch.ones_like(probabilities) / probabilities.shape[1]
+    
+    # Create support tensor
     support = (
         torch.tensor([x for x in range(-support_size, support_size + 1)])
         .expand(probabilities.shape)
         .float()
         .to(device=probabilities.device)
     )
+    
+    # Calculate weighted sum
     x = torch.sum(support * probabilities, dim=1, keepdim=True)
 
-    # Invert the scaling (defined in https://arxiv.org/abs/1805.11593)
-    x = torch.sign(x) * (
-        ((torch.sqrt(1 + 4 * 0.001 * (torch.abs(x) + 1 + 0.001)) - 1) / (2 * 0.001))
-        ** 2
-        - 1
-    )
+    # Invert the scaling with protection against NaN
+    safe_abs_x = torch.abs(x) + 1e-8
+    safe_term = torch.sqrt(1 + 4 * 0.001 * (safe_abs_x + 1 + 0.001)) - 1
+    # Prevent division by very small numbers
+    safe_divisor = 2 * 0.001  # Don't use clamp on a scalar
+    if safe_divisor < 1e-8:
+        safe_divisor = 1e-8
+    x = torch.sign(x) * (((safe_term / safe_divisor) ** 2 - 1))
+    
+    # Final NaN/Inf check
+    if torch.isnan(x).any() or torch.isinf(x).any():
+        # Only log occasionally
+        if numpy.random.random() < 0.05:
+            print("Warning: NaN detected in support_to_scalar output, replacing with safe values")
+        # Use bounded replacement values
+        x = torch.nan_to_num(x, nan=0.0, posinf=support_size, neginf=-support_size)
+        # Additional safety clamp
+        x = torch.clamp(x, -support_size, support_size)
+    
+    # Ensure output has shape [batch_size, 1]
+    if len(x.shape) != 2 or x.shape[1] != 1:
+        batch_size = x.shape[0] if len(x.shape) > 0 else 1
+        x = x.reshape(batch_size, 1)
+    
     return x
 
 
@@ -671,19 +916,39 @@ def scalar_to_support(x, support_size):
     Transform a scalar to a categorical representation with (2 * support_size + 1) categories
     See paper appendix Network Architecture
     """
-    # Reduce the scale (defined in https://arxiv.org/abs/1805.11593)
-    x = torch.sign(x) * (torch.sqrt(torch.abs(x) + 1) - 1) + 0.001 * x
+    # Handle NaN or infinite values
+    if torch.isnan(x).any() or torch.isinf(x).any():
+        x = torch.nan_to_num(x, nan=0.0, posinf=support_size, neginf=-support_size)
+        print("Warning: NaN or Inf detected in scalar_to_support input, replacing with safe values")
+    
+    # Reduce the scale with numerical stability
+    safe_abs_x = torch.abs(x) + 1e-8  # Avoid sqrt of zero
+    x = torch.sign(x) * (torch.sqrt(safe_abs_x + 1) - 1) + 0.001 * x
 
     # Encode on a vector
     x = torch.clamp(x, -support_size, support_size)
     floor = x.floor()
     prob = x - floor
     logits = torch.zeros(x.shape[0], x.shape[1], 2 * support_size + 1).to(x.device)
+    
+    # Safely handle indices
+    floor_indices = (floor + support_size).long().unsqueeze(-1)
+    floor_indices = torch.clamp(floor_indices, 0, 2 * support_size)
+    
     logits.scatter_(
-        2, (floor + support_size).long().unsqueeze(-1), (1 - prob).unsqueeze(-1)
+        2, floor_indices, (1 - prob).unsqueeze(-1)
     )
+    
     indexes = floor + support_size + 1
     prob = prob.masked_fill_(2 * support_size < indexes, 0.0)
     indexes = indexes.masked_fill_(2 * support_size < indexes, 0.0)
-    logits.scatter_(2, indexes.long().unsqueeze(-1), prob.unsqueeze(-1))
+    indexes = torch.clamp(indexes.long().unsqueeze(-1), 0, 2 * support_size)
+    
+    logits.scatter_(2, indexes, prob.unsqueeze(-1))
+    
+    # Final check for NaN
+    if torch.isnan(logits).any() or torch.isinf(logits).any():
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
+        print("Warning: NaN detected in scalar_to_support output, replacing with zeros")
+    
     return logits

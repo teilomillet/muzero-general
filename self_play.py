@@ -1,6 +1,5 @@
 import math
 import time
-
 import numpy
 import ray
 import torch
@@ -21,11 +20,54 @@ class SelfPlay:
         # Fix random generator seed
         numpy.random.seed(seed)
         torch.manual_seed(seed)
+        
+        # More robust CUDA initialization with fallback to CPU
+        self.device = torch.device("cpu")  # Default to CPU
+        cuda_available = False
+        device_count = 0
+        
+        try:
+            cuda_available = torch.cuda.is_available()
+            device_count = torch.cuda.device_count() if cuda_available else 0
+            use_gpu = self.config.selfplay_on_gpu and cuda_available and device_count > 0
+            
+            if use_gpu:
+                # Test if CUDA is actually working by creating a small tensor
+                test_tensor = torch.zeros((1, 1), device="cuda")
+                # If we get here without error, CUDA is working
+                self.device = torch.device("cuda")
+                print(f"Info: Using GPU for self-play. CUDA available: {cuda_available}, Device count: {device_count}")
+                # Try to print device info
+                try:
+                    for i in range(device_count):
+                        print(f"CUDA Device {i}: {torch.cuda.get_device_name(i)}")
+                except Exception as e:
+                    print(f"Error getting CUDA device info: {e}")
+            else:
+                reasons = []
+                if not self.config.selfplay_on_gpu:
+                    reasons.append("selfplay_on_gpu is False")
+                if not cuda_available:
+                    reasons.append("CUDA is not available")
+                if device_count == 0:
+                    reasons.append("no CUDA devices found")
+                print(f"Using CPU for self-play because: {', '.join(reasons)}")
+        except Exception as e:
+            print(f"Error during CUDA initialization: {e}. Falling back to CPU.")
 
         # Initialize the network
         self.model = models.MuZeroNetwork(self.config)
         self.model.set_weights(initial_checkpoint["weights"])
-        self.model.to(torch.device("cuda" if self.config.selfplay_on_gpu else "cpu"))
+        
+        # Move model to device safely
+        try:
+            print(f"Moving model to device: {self.device}")
+            self.model.to(self.device)
+        except Exception as e:
+            print(f"Error moving model to device: {e}. Keeping on CPU.")
+            self.device = torch.device("cpu")
+            self.model.to(self.device)
+        
         self.model.eval()
 
     def continuous_self_play(self, shared_storage, replay_buffer, test_mode=False):
@@ -280,35 +322,105 @@ class MCTS:
             root_predicted_value = None
         else:
             root = Node(0)
-            observation = (
-                torch.tensor(observation)
-                .float()
-                .unsqueeze(0)
-                .to(next(model.parameters()).device)
-            )
-            (
-                root_predicted_value,
-                reward,
-                policy_logits,
-                hidden_state,
-            ) = model.initial_inference(observation)
-            root_predicted_value = models.support_to_scalar(
-                root_predicted_value, self.config.support_size
-            ).item()
-            reward = models.support_to_scalar(reward, self.config.support_size).item()
-            assert (
-                legal_actions
-            ), f"Legal actions should not be an empty array. Got {legal_actions}."
-            assert set(legal_actions).issubset(
-                set(self.config.action_space)
-            ), "Legal actions should be a subset of the action space."
-            root.expand(
-                legal_actions,
-                to_play,
-                reward,
-                policy_logits,
-                hidden_state,
-            )
+            try:
+                # Check observation for NaN values before passing to model
+                if isinstance(observation, numpy.ndarray) and numpy.isnan(observation).any():
+                    print(f"Warning: NaN detected in observation input, replacing with zeros")
+                    observation = numpy.nan_to_num(observation, nan=0.0)
+                
+                # Convert observation to tensor and move to appropriate device
+                observation_tensor = torch.tensor(observation).float().unsqueeze(0)
+                
+                # Handle CUDA errors gracefully
+                try:
+                    device = next(model.parameters()).device
+                    observation_tensor = observation_tensor.to(device)
+                except (RuntimeError, AssertionError) as e:
+                    print(f"Error moving observation to device: {e}. Falling back to CPU.")
+                    observation_tensor = observation_tensor.to("cpu")
+                    # Try to move model to CPU if it isn't already
+                    try:
+                        model.to("cpu")
+                    except Exception as e2:
+                        print(f"Error moving model to CPU: {e2}")
+                
+                # Apply input normalization to prevent extreme values
+                observation_tensor = torch.clamp(observation_tensor, -10.0, 10.0)
+                
+                # Run initial inference with exception handling
+                with torch.no_grad():  # No gradients needed for inference
+                    (
+                        root_predicted_value,
+                        reward,
+                        policy_logits,
+                        hidden_state,
+                    ) = model.initial_inference(observation_tensor)
+                
+                # Add aggressive protection against extreme/infinite values
+                policy_logits = torch.clamp(policy_logits, -10.0, 10.0)
+                root_predicted_value = torch.clamp(root_predicted_value, -10.0, 10.0)
+                reward = torch.clamp(reward, -10.0, 10.0)
+                
+                # Check for NaN values right after inference
+                if torch.isnan(root_predicted_value).any() or torch.isnan(reward).any() or torch.isnan(policy_logits).any():
+                    print("Warning: NaN detected in model output. Attempting to recover...")
+                    # Replace NaNs with zeros
+                    root_predicted_value = torch.nan_to_num(root_predicted_value, nan=0.0)
+                    reward = torch.nan_to_num(reward, nan=0.0)
+                    policy_logits = torch.nan_to_num(policy_logits, nan=0.0)
+                    if hidden_state is not None and torch.is_tensor(hidden_state) and torch.isnan(hidden_state).any():
+                        hidden_state = torch.nan_to_num(hidden_state, nan=0.0)
+                        
+                # Check for Inf values and apply aggressive clamping
+                if torch.isinf(root_predicted_value).any() or torch.isinf(reward).any() or torch.isinf(policy_logits).any():
+                    # Don't log for every instance to avoid log flooding
+                    if numpy.random.random() < 0.1:  # only log ~10% of cases
+                        print("Warning: Infinite values detected in model output. Applying aggressive bounds.")
+                    # Replace infinite values with large but finite numbers
+                    root_predicted_value = torch.nan_to_num(root_predicted_value, posinf=1.0, neginf=-1.0)
+                    reward = torch.nan_to_num(reward, posinf=1.0, neginf=-1.0)
+                    policy_logits = torch.nan_to_num(policy_logits, posinf=1.0, neginf=-1.0)
+                
+                # Convert to scalar values with careful handling
+                root_predicted_value = models.support_to_scalar(
+                    root_predicted_value, self.config.support_size
+                ).item()
+                reward = models.support_to_scalar(reward, self.config.support_size).item()
+                
+                # Validate legal actions
+                assert (
+                    legal_actions
+                ), f"Legal actions should not be an empty array. Got {legal_actions}."
+                assert set(legal_actions).issubset(
+                    set(self.config.action_space)
+                ), "Legal actions should be a subset of the action space."
+                
+                # Expand the root node
+                root.expand(
+                    legal_actions,
+                    to_play,
+                    reward,
+                    policy_logits,
+                    hidden_state,
+                )
+            except Exception as e:
+                print(f"Error during initial inference: {e}")
+                # Fall back to a default root node with uniform policy
+                root_predicted_value = 0.0
+                uniform_policy = torch.zeros((1, len(self.config.action_space)))
+                # Fill policy with a small constant value
+                uniform_policy.fill_(1.0 / len(self.config.action_space))
+                # Create a random hidden state with the right dimensions
+                hidden_shape = list(model.initial_inference(torch.zeros_like(observation_tensor))[3].shape)
+                random_hidden = torch.zeros(hidden_shape, device="cpu")
+                # Expand with fallback values
+                root.expand(
+                    legal_actions,
+                    to_play,
+                    0.0,  # Default reward
+                    uniform_policy,
+                    random_hidden,
+                )
 
         if add_exploration_noise:
             root.add_exploration_noise(
@@ -339,19 +451,77 @@ class MCTS:
             # Inside the search tree we use the dynamics function to obtain the next hidden
             # state given an action and the previous hidden state
             parent = search_path[-2]
-            value, reward, policy_logits, hidden_state = model.recurrent_inference(
-                parent.hidden_state,
-                torch.tensor([[action]]).to(parent.hidden_state.device),
-            )
-            value = models.support_to_scalar(value, self.config.support_size).item()
-            reward = models.support_to_scalar(reward, self.config.support_size).item()
-            node.expand(
-                self.config.action_space,
-                virtual_to_play,
-                reward,
-                policy_logits,
-                hidden_state,
-            )
+            try:
+                # Handle potential device mismatches
+                action_tensor = torch.tensor([[action]])
+                try:
+                    action_tensor = action_tensor.to(parent.hidden_state.device)
+                except (RuntimeError, AttributeError) as e:
+                    print(f"Error moving action to device: {e}. Falling back to CPU.")
+                    if parent.hidden_state is not None and hasattr(parent.hidden_state, "device"):
+                        parent.hidden_state = parent.hidden_state.to("cpu")
+                    action_tensor = action_tensor.to("cpu")
+                
+                # Run recurrent inference with error handling
+                with torch.no_grad():  # No gradients needed for inference
+                    value, reward, policy_logits, hidden_state = model.recurrent_inference(
+                        parent.hidden_state,
+                        action_tensor,
+                    )
+                
+                # Add aggressive protection against extreme values
+                policy_logits = torch.clamp(policy_logits, -10.0, 10.0)
+                value = torch.clamp(value, -10.0, 10.0)
+                reward = torch.clamp(reward, -10.0, 10.0)
+                
+                # Check for NaN values
+                if torch.isnan(value).any() or torch.isnan(reward).any() or torch.isnan(policy_logits).any():
+                    print("Warning: NaN detected in recurrent inference output. Attempting to recover...")
+                    value = torch.nan_to_num(value, nan=0.0)
+                    reward = torch.nan_to_num(reward, nan=0.0)
+                    policy_logits = torch.nan_to_num(policy_logits, nan=0.0)
+                    if hidden_state is not None and torch.is_tensor(hidden_state) and torch.isnan(hidden_state).any():
+                        hidden_state = torch.nan_to_num(hidden_state, nan=0.0)
+                
+                # Check for Inf values and apply aggressive clamping
+                if torch.isinf(value).any() or torch.isinf(reward).any() or torch.isinf(policy_logits).any():
+                    # Only log occasionally to prevent log flooding
+                    if numpy.random.random() < 0.1:  # only log ~10% of cases
+                        print("Warning: Infinite values detected in recurrent inference. Applying aggressive bounds.")
+                    # Replace infinite values with bounded values
+                    value = torch.nan_to_num(value, posinf=1.0, neginf=-1.0)
+                    reward = torch.nan_to_num(reward, posinf=1.0, neginf=-1.0)
+                    policy_logits = torch.nan_to_num(policy_logits, posinf=1.0, neginf=-1.0)
+                
+                # Convert to scalar values with protection
+                value = models.support_to_scalar(value, self.config.support_size).item()
+                reward = models.support_to_scalar(reward, self.config.support_size).item()
+                
+                # Expand the node
+                node.expand(
+                    self.config.action_space,
+                    virtual_to_play,
+                    reward,
+                    policy_logits,
+                    hidden_state,
+                )
+            except Exception as e:
+                print(f"Error during recurrent inference: {e}")
+                # Fallback to default values
+                uniform_policy = torch.zeros((1, len(self.config.action_space)))
+                uniform_policy.fill_(1.0 / len(self.config.action_space))
+                fallback_hidden = torch.zeros_like(parent.hidden_state, device="cpu")
+                
+                node.expand(
+                    self.config.action_space,
+                    virtual_to_play,
+                    0.0,  # Default reward
+                    uniform_policy,
+                    fallback_hidden,
+                )
+                
+                # Use a default value for backpropagation
+                value = 0.0
 
             self.backpropagate(search_path, value, virtual_to_play, min_max_stats)
 

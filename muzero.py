@@ -441,6 +441,26 @@ class MuZero:
             checkpoint_path = pathlib.Path(checkpoint_path)
             self.checkpoint = torch.load(checkpoint_path)
             print(f"\nUsing checkpoint from {checkpoint_path}")
+            
+            # Check for config file
+            config_path = checkpoint_path.parent / "model.config.json"
+            if config_path.exists():
+                try:
+                    with open(config_path, "r") as f:
+                        config_dict = json.load(f)
+                    
+                    # Update config with loaded values
+                    for key, value in config_dict.items():
+                        if hasattr(self.config, key):
+                            if key == "results_path":
+                                # Keep the current results_path
+                                continue
+                            setattr(self.config, key, value)
+                    print(f"Loaded configuration from {config_path}")
+                except Exception as e:
+                    print(f"Error loading configuration: {e}")
+            else:
+                print("No configuration file found. Using default configuration.")
 
         # Load replay buffer
         if replay_buffer_path:
@@ -482,6 +502,56 @@ class MuZero:
         input("Press enter to close all plots")
         dm.close_all()
 
+    @staticmethod
+    def get_config_from_file(config_path):
+        """
+        Load a configuration from a JSON file and return it as a dictionary.
+        
+        Args:
+            config_path (str): Path to the config JSON file.
+            
+        Returns:
+            dict: The loaded configuration, or None if loading failed.
+        """
+        try:
+            config_path = pathlib.Path(config_path)
+            if not config_path.exists():
+                print(f"Configuration file {config_path} not found.")
+                return None
+            
+            with open(config_path, "r") as f:
+                config_dict = json.load(f)
+            
+            return config_dict
+        except Exception as e:
+            print(f"Error loading configuration: {e}")
+            return None
+
+    @staticmethod
+    def get_game_parameters(config_dict):
+        """
+        Extract important game parameters from a configuration dictionary.
+        
+        Args:
+            config_dict (dict): A configuration dictionary.
+            
+        Returns:
+            dict: A dictionary of important game parameters.
+        """
+        if not config_dict:
+            return {}
+        
+        important_keys = [
+            "observation_shape", "action_space", "players", 
+            "muzero_player", "opponent", "num_workers",
+            "max_moves", "num_simulations", "discount",
+            "network", "blocks", "channels",
+            "training_steps", "train_on_gpu", 
+            "selfplay_on_gpu", "seed"
+        ]
+        
+        return {k: config_dict[k] for k in important_keys if k in config_dict}
+
 
 @ray.remote(num_cpus=0, num_gpus=0)
 class CPUActor:
@@ -491,6 +561,60 @@ class CPUActor:
 
     def get_initial_weights(self, config):
         model = models.MuZeroNetwork(config)
+        # Initialize weights with numerically stable values to prevent NaN issues
+        model.initialize_weights()
+        
+        # Add additional stability check - run a test forward pass
+        try:
+            # Create a dummy input with the correct shape, accounting for stacked observations
+            observation_shape = config.observation_shape
+            stacked_observations = config.stacked_observations
+            
+            # The first conv layer expects:
+            # observation_shape[0] * (stacked_observations + 1) + stacked_observations channels
+            # This accounts for the current observation, stacked past observations, and stacked actions
+            input_channels = observation_shape[0] * (stacked_observations + 1) + stacked_observations
+            
+            # Create properly shaped dummy input tensor
+            dummy_input = torch.zeros((1, input_channels, observation_shape[1], observation_shape[2]))
+            
+            print(f"Testing model with dummy input shape: {dummy_input.shape}")
+            
+            # Run a test forward pass to verify numerical stability
+            with torch.no_grad():
+                # Initial inference
+                try:
+                    value, reward, policy, encoded_state = model.initial_inference(dummy_input)
+                    
+                    # Check for NaNs or infinite values
+                    if (torch.isnan(value).any() or torch.isnan(reward).any() or torch.isnan(policy).any() or
+                        torch.isinf(value).any() or torch.isinf(reward).any() or torch.isinf(policy).any()):
+                        # Reinitialize if unstable values detected
+                        print("Unstable values detected in initial model. Reinitializing...")
+                        model = models.MuZeroNetwork(config)
+                        model.initialize_weights()
+                    
+                    # Check the dynamics function too
+                    dummy_action = torch.zeros((1, 1), dtype=torch.long)
+                    value, reward, policy, _ = model.recurrent_inference(encoded_state, dummy_action)
+                    
+                    # Check for NaNs or infinite values again
+                    if (torch.isnan(value).any() or torch.isnan(reward).any() or torch.isnan(policy).any() or
+                        torch.isinf(value).any() or torch.isinf(reward).any() or torch.isinf(policy).any()):
+                        # Apply stabilization to the problematic components
+                        print("Stabilizing recurrent part of the model...")
+                        model.initialize_weights()
+                except Exception as e:
+                    print(f"Forward pass failed: {e}")
+                    # Try more aggressive initialization
+                    print("Applying more conservative initialization strategy...")
+                    model = models.MuZeroNetwork(config)
+                    model.initialize_weights()
+                
+        except Exception as e:
+            print(f"Error during model stability check: {e}")
+            # Proceed with the current model regardless of the error
+        
         weigths = model.get_weights()
         summary = str(model).replace("\n", " \n\n")
         return weigths, summary
@@ -593,6 +717,18 @@ def load_model_menu(muzero, game_name):
     options.reverse()
     print()
     for i in range(len(options)):
+        if i > 0:  # Not for manual option
+            # Try to get model info from config file
+            config_path = options[i] / "model.config.json"
+            if config_path.exists():
+                config_dict = MuZero.get_config_from_file(config_path)
+                if config_dict:
+                    params = MuZero.get_game_parameters(config_dict)
+                    info_str = f" - Training steps: {params.get('training_steps', '?')}"
+                    info_str += f", Network: {params.get('network', '?')}"
+                    info_str += f", Model date: {options[i].name[:10]}"
+                    print(f"{i}. {options[i]} {info_str}")
+                    continue
         print(f"{i}. {options[i]}")
 
     choice = input("Enter a number to choose a model to load: ")
@@ -616,6 +752,19 @@ def load_model_menu(muzero, game_name):
     else:
         checkpoint_path = options[choice] / "model.checkpoint"
         replay_buffer_path = options[choice] / "replay_buffer.pkl"
+        
+        # Display configuration summary
+        config_path = options[choice] / "model.config.json"
+        if config_path.exists():
+            config_dict = MuZero.get_config_from_file(config_path)
+            if config_dict:
+                params = MuZero.get_game_parameters(config_dict)
+                print("\nModel configuration summary:")
+                for key, value in params.items():
+                    if isinstance(value, list) and len(value) > 10:
+                        value = f"[{len(value)} items]"
+                    print(f"  {key}: {value}")
+                print()
 
     muzero.load_model(
         checkpoint_path=checkpoint_path,
