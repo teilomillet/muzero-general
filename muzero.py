@@ -21,6 +21,11 @@ import self_play
 import shared_storage
 import trainer
 
+# Add ELO rating import
+try:
+    from elo_rating import EloRating
+except ImportError:
+    EloRating = None
 
 class MuZero:
     """
@@ -552,6 +557,72 @@ class MuZero:
         
         return {k: config_dict[k] for k in important_keys if k in config_dict}
 
+    def evaluate_elo(self, other_model_paths=None, num_games=10, base_k=32):
+        """
+        Evaluate current model against other models using ELO rating system.
+        
+        Args:
+            other_model_paths (list): List of paths to other model checkpoints to evaluate against
+            num_games (int): Number of games to play per matchup
+            base_k (int): K-factor for ELO calculation
+            
+        Returns:
+            tuple: (EloRating object, ratings table DataFrame)
+        """
+        if EloRating is None:
+            print("Error: Could not import EloRating. Make sure elo_rating.py is in your path.")
+            return None, None
+            
+        # Extract game name from config
+        game_name = None
+        for module_name, module in sys.modules.items():
+            if hasattr(module, 'Game') and hasattr(module, 'MuZeroConfig'):
+                if isinstance(self.Game, module.Game.__class__):
+                    game_name = module_name.split('.')[-1]
+                    break
+                    
+        if game_name is None:
+            game_name = input("Could not determine game name. Please enter it: ")
+            
+        # Initialize ELO rating system
+        elo = EloRating(game_name, base_k=base_k)
+        
+        # Get current model path - use results_path if it exists
+        current_model_path = self.config.results_path
+        if not current_model_path.exists():
+            # Create a temporary directory for the current model
+            current_model_path = pathlib.Path(f"results/{game_name}/current_model")
+            current_model_path.mkdir(parents=True, exist_ok=True)
+            # Save the current model
+            torch.save(
+                self.checkpoint,
+                current_model_path / "model.checkpoint",
+            )
+        
+        # Add current model to ELO ratings
+        elo.add_model(current_model_path)
+        
+        # If no other models specified, use all models in results directory
+        if other_model_paths is None:
+            other_model_paths = elo._get_model_paths()
+            # Remove current model path if it's there
+            other_model_paths = [p for p in other_model_paths if p != current_model_path]
+        
+        # Run tournament
+        results = []
+        for other_path in other_model_paths:
+            result = elo.play_match(current_model_path, other_path, num_games=num_games, muzero_instance=self)
+            results.append(result)
+        
+        # Get ratings table
+        ratings_table = elo.get_ratings_table()
+        
+        # Print ratings
+        print("\nELO Ratings:")
+        print(ratings_table[["model_id", "rating", "games_played", "wins", "draws", "losses", "win_rate"]])
+        
+        return elo, ratings_table
+
 
 @ray.remote(num_cpus=0, num_gpus=0)
 class CPUActor:
@@ -812,6 +883,7 @@ if __name__ == "__main__":
                 "Play against MuZero",
                 "Test the game manually",
                 "Hyperparameter search",
+                "Run ELO evaluation",
                 "Exit",
             ]
             print()
@@ -858,6 +930,18 @@ if __name__ == "__main__":
                     game_name, parametrization, budget, parallel_experiments, 20
                 )
                 muzero = MuZero(game_name, best_hyperparameters)
+            elif choice == 7:
+                # Run ELO evaluation
+                if EloRating is None:
+                    print("Error: Could not import EloRating. Make sure elo_rating.py is in your path.")
+                else:
+                    num_games = int(input("Enter number of games to play per matchup: "))
+                    elo, _ = muzero.evaluate_elo(num_games=num_games)
+                    
+                    # Plot ratings if we have a history
+                    if elo and elo.history:
+                        elo.plot_ratings(output_path=f"results/{game_name}/elo_ratings.png")
+                        print(f"Rating plot saved to results/{game_name}/elo_ratings.png")
             else:
                 break
             print("\nDone")

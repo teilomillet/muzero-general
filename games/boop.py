@@ -31,14 +31,14 @@ class MuZeroConfig:
         ### Self-Play
         self.num_workers = 4  # Increased for faster self-play
         self.selfplay_on_gpu = True  # Utilize GPU for self-play
-        self.max_moves = 50  # Maximum number of moves if game is not finished before
-        self.num_simulations = 50  # Moderate number of simulations for faster iteration
+        self.max_moves = 100  # Maximum number of moves if game is not finished before
+        self.num_simulations = 150  # Increased from 50 to 150 for deeper search
         self.discount = 1.0  # Board game with final reward
         self.temperature_threshold = 10  # Apply temperature reduction after 10 moves
 
         # Root prior exploration noise
-        self.root_dirichlet_alpha = 0.3  # Slightly increased for more exploration
-        self.root_exploration_fraction = 0.25
+        self.root_dirichlet_alpha = 0.5  # Increased from 0.3 to 0.5 for more exploration
+        self.root_exploration_fraction = 0.35  # Increased from 0.25 to 0.35 for more exploration
 
         # UCB formula
         self.pb_c_base = 19652
@@ -50,14 +50,14 @@ class MuZeroConfig:
 
         # Residual Network
         self.downsample = False  # No downsampling needed for 6x6 board
-        self.blocks = 4  # Moderate number of blocks for faster training
-        self.channels = 64  # Moderate number of channels for faster training
-        self.reduced_channels_reward = 64  # Match channels
-        self.reduced_channels_value = 64  # Match channels
-        self.reduced_channels_policy = 64  # Match channels
-        self.resnet_fc_reward_layers = [64]  # Simplified for faster training
-        self.resnet_fc_value_layers = [64]  # Simplified for faster training
-        self.resnet_fc_policy_layers = [64]  # Simplified for faster training
+        self.blocks = 6  # Increased from 4 to 6 for more capacity
+        self.channels = 96  # Increased from 64 to 96 for more capacity
+        self.reduced_channels_reward = 96  # Match channels
+        self.reduced_channels_value = 96  # Match channels
+        self.reduced_channels_policy = 96  # Match channels
+        self.resnet_fc_reward_layers = [96]  # Match channels
+        self.resnet_fc_value_layers = [96]  # Match channels
+        self.resnet_fc_policy_layers = [96]  # Match channels
 
         # Fully Connected Network
         self.encoding_size = 64  # Moderate size for faster training
@@ -299,11 +299,15 @@ class Boop:
         """
         Reset the game for a new game.
         """
+        # Clear the board completely
         self.board = np.zeros((2, self.board_size, self.board_size), dtype=np.int8)
         self.player = 0
         self.done = False
         self.move_count = 0
         self.board_history = []
+        
+        # Debug print to verify reset
+        print("Board reset complete. Board is empty.")
         return self.get_observation()
 
     def step(self, action):
@@ -437,11 +441,21 @@ class Boop:
         if self.done:
             return legal
         
+        # Print debugging info
+        if not hasattr(self, 'debug_printed'):
+            print(f"DEBUG: Board shape: {self.board.shape}")
+            self.debug_printed = True
+            
         # Any empty cell is a legal move
         for r in range(self.board_size):
             for c in range(self.board_size):
                 if self.board[0, r, c] == 0 and self.board[1, r, c] == 0:
                     legal.append(r * self.board_size + c)
+                else:
+                    # Debug info for occupied cells
+                    position = r * self.board_size + c
+                    if position == 21:  # Position (3,3)
+                        print(f"DEBUG: Position ({r},{c}) is occupied by Player 1: {self.board[0, r, c]}, Player 2: {self.board[1, r, c]}")
         
         return legal
 
