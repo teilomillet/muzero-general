@@ -25,14 +25,14 @@ class MuZeroConfig:
         self.stacked_observations = 2  # Increased to give more history context
 
         # Evaluate
-        self.muzero_player = 0  # Turn Muzero begins to play (0: MuZero plays first, 1: MuZero plays second)
+        self.muzero_player = 0  # Turn MuZero begins to play (0: MuZero plays first, 1: MuZero plays second)
         self.opponent = "random"  # Hard coded agent that MuZero faces to assess his progress in multiplayer games. It doesn't influence training. None, "random" or "expert" if implemented in the Game class
 
         ### Self-Play
         self.num_workers = 4  # Increased for faster self-play
         self.selfplay_on_gpu = True  # Utilize GPU for self-play
         self.max_moves = 50  # Maximum number of moves if game is not finished before
-        self.num_simulations = 100  # Increased for better planning
+        self.num_simulations = 50  # Moderate number of simulations for faster iteration
         self.discount = 1.0  # Board game with final reward
         self.temperature_threshold = 10  # Apply temperature reduction after 10 moves
 
@@ -50,29 +50,29 @@ class MuZeroConfig:
 
         # Residual Network
         self.downsample = False  # No downsampling needed for 6x6 board
-        self.blocks = 6  # Increased for better representation capacity
-        self.channels = 128  # Increased for better representation
-        self.reduced_channels_reward = 128  # Increased to match channels
-        self.reduced_channels_value = 128  # Increased to match channels
-        self.reduced_channels_policy = 128  # Increased to match channels
-        self.resnet_fc_reward_layers = [128, 64]  # Added layer for better reward modeling
-        self.resnet_fc_value_layers = [128, 64]  # Added layer for better value estimation
-        self.resnet_fc_policy_layers = [128, 64]  # Added layer for better policy
+        self.blocks = 4  # Moderate number of blocks for faster training
+        self.channels = 64  # Moderate number of channels for faster training
+        self.reduced_channels_reward = 64  # Match channels
+        self.reduced_channels_value = 64  # Match channels
+        self.reduced_channels_policy = 64  # Match channels
+        self.resnet_fc_reward_layers = [64]  # Simplified for faster training
+        self.resnet_fc_value_layers = [64]  # Simplified for faster training
+        self.resnet_fc_policy_layers = [64]  # Simplified for faster training
 
         # Fully Connected Network
-        self.encoding_size = 128  # Increased
-        self.fc_representation_layers = [256, 128]  # Deeper representation
-        self.fc_dynamics_layers = [256, 128]  # Deeper dynamics
-        self.fc_reward_layers = [256, 128]  # Deeper reward
-        self.fc_value_layers = [256, 128]  # Deeper value
-        self.fc_policy_layers = [256, 128]  # Deeper policy
+        self.encoding_size = 64  # Moderate size for faster training
+        self.fc_representation_layers = [128]  # Simplified for faster training
+        self.fc_dynamics_layers = [128]  # Simplified for faster training
+        self.fc_reward_layers = [128]  # Simplified for faster training
+        self.fc_value_layers = [128]  # Simplified for faster training
+        self.fc_policy_layers = [128]  # Simplified for faster training
 
         ### Training
         self.results_path = pathlib.Path(__file__).resolve().parents[1] / "results" / pathlib.Path(__file__).stem / datetime.datetime.now().strftime("%Y-%m-%d--%H-%M-%S")  # Path to store the model weights and TensorBoard logs
         self.save_model = True  # Save the checkpoint in results_path as model.checkpoint
-        self.training_steps = 200000  # Increased total training steps for better learning
-        self.batch_size = 256  # Increased batch size for more stable learning
-        self.checkpoint_interval = 25  # More frequent checkpoints
+        self.training_steps = 10000  # Reduced for initial testing
+        self.batch_size = 128  # Moderate batch size for faster iteration
+        self.checkpoint_interval = 100  # More frequent checkpoints relative to total steps
         self.value_loss_weight = 0.25  # Scale the value loss to avoid overfitting of the value function, paper recommends 0.25 (See paper appendix Reanalyze)
         self.train_on_gpu = torch.cuda.is_available()  # Train on GPU if available
 
@@ -82,15 +82,15 @@ class MuZeroConfig:
 
         # Exponential learning rate schedule
         self.lr_init = 0.01  # Increased initial learning rate
-        self.lr_decay_rate = 0.95  # Slower decay
-        self.lr_decay_steps = 5000  # More frequent decay
+        self.lr_decay_rate = 0.9  # Moderate decay
+        self.lr_decay_steps = 1000  # Adjusted for shorter training
 
         ### Replay Buffer
-        self.replay_buffer_size = 10000  # Increased buffer size for more diverse experiences
+        self.replay_buffer_size = 1000  # Scaled down for shorter training
         self.num_unroll_steps = 20  # Number of game moves to keep for every batch element
-        self.td_steps = 50  # Increased to match max_moves for final reward
+        self.td_steps = 50  # Match with max_moves for final reward
         self.PER = True  # Prioritized Replay
-        self.PER_alpha = 1.0  # Increased as suggested in paper
+        self.PER_alpha = 1.0  # Full prioritization as suggested in paper
 
         # Reanalyze (See paper appendix Reanalyse)
         self.use_last_model_value = True  # Use the last model to provide a fresher, stable n-step value
@@ -110,11 +110,11 @@ class MuZeroConfig:
         Returns:
             Positive float.
         """
-        if trained_steps < 0.5 * self.training_steps:
+        if trained_steps < 0.5 * self.training_steps:  # First 5000 steps
             return 1.0
-        elif trained_steps < 0.75 * self.training_steps:
+        elif trained_steps < 0.75 * self.training_steps:  # Next 2500 steps
             return 0.5
-        else:
+        else:  # Final 2500 steps
             return 0.25
 
 

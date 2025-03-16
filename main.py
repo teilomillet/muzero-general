@@ -6,17 +6,19 @@ def main():
     # Initialize wandb with more detailed configuration
     wandb.init(
         project="muzero-boop",
-        name="muzero-boop-optimized",
+        name="muzero-boop-test-run",
         config={
             "game": "boop",
-            "num_simulations": 100,
+            "num_simulations": 50,
             "num_workers": 4,
             "training_steps": 10000,
-            "batch_size": 256,
+            "batch_size": 128,
             "optimizer": "SGD",
             "network": "resnet",
-            "blocks": 6,
-            "channels": 128
+            "blocks": 4,
+            "channels": 64,
+            "replay_buffer_size": 1000,
+            "test_run": True
         }
     )
     
