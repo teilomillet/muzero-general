@@ -143,7 +143,8 @@ class MuZero:
         # Log config to wandb
         if wandb.run is not None:
             wandb.config.update({k: v for k, v in self.config.__dict__.items() 
-                               if not k.startswith('__') and not callable(v)})
+                               if not k.startswith('__') and not callable(v)},
+                              allow_val_change=True)
 
         # Manage GPUs
         if 0 < self.num_gpus:

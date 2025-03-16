@@ -65,27 +65,30 @@ class SelfPlay:
                 shared_storage.set_info.remote(
                     {
                         "episode_length": len(game_history.action_history) - 1,
-                        "total_reward": sum(game_history.reward_history),
+                        "total_reward": ray.get(shared_storage.get_info.remote("total_reward")) + sum(game_history.reward_history),
                         "mean_value": numpy.mean(
                             [value for value in game_history.root_values if value]
                         ),
                     }
                 )
                 if 1 < len(self.config.players):
+                    muzero_reward = sum(
+                        reward
+                        for i, reward in enumerate(game_history.reward_history)
+                        if game_history.to_play_history[i - 1]
+                        == self.config.muzero_player
+                    )
+                    opponent_reward = sum(
+                        reward
+                        for i, reward in enumerate(game_history.reward_history)
+                        if game_history.to_play_history[i - 1]
+                        != self.config.muzero_player
+                    )
+                    
                     shared_storage.set_info.remote(
                         {
-                            "muzero_reward": sum(
-                                reward
-                                for i, reward in enumerate(game_history.reward_history)
-                                if game_history.to_play_history[i - 1]
-                                == self.config.muzero_player
-                            ),
-                            "opponent_reward": sum(
-                                reward
-                                for i, reward in enumerate(game_history.reward_history)
-                                if game_history.to_play_history[i - 1]
-                                != self.config.muzero_player
-                            ),
+                            "muzero_reward": ray.get(shared_storage.get_info.remote("muzero_reward")) + muzero_reward,
+                            "opponent_reward": ray.get(shared_storage.get_info.remote("opponent_reward")) + opponent_reward,
                         }
                     )
 
